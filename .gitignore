@@ -1,0 +1,36 @@
+# Output media files
+*.mp4
+*.mp3
+*.wav
+
+# Pipeline output data files
+*.srt
+*.log
+*.json
+
+# Plain-text outputs
+transcript.txt
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Claude Code internal state
+.claude/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Keep these explicitly (overrides any broad rules above)
+!requirements.txt
+!Dockerfile
+!*.py
+!.gitignore
