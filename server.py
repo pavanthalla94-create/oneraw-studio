@@ -9,6 +9,7 @@ import threading
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import List
 
 import requests
 import boto3
@@ -106,31 +107,87 @@ def _get_job(job_id: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Download + merge helpers
+# ---------------------------------------------------------------------------
+
+def _download_video(url: str, dest: Path) -> None:
+    with requests.get(url, stream=True, timeout=600) as resp:
+        resp.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                f.write(chunk)
+
+
+def _merge_videos(paths: List[Path], output: Path) -> None:
+    """Concatenate videos in sequence using FFmpeg concat demuxer (stream copy)."""
+    concat_list = output.parent / "concat_list.txt"
+    lines = [f"file '{p.as_posix()}'\n" for p in paths]
+    concat_list.write_text("".join(lines), encoding="utf-8")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_list),
+        "-c", "copy",
+        str(output),
+    ]
+    log.info("Merging %d videos -> %s", len(paths), output.name)
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg merge failed:\n{result.stderr[-3000:]}")
+    concat_list.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Background worker
 # ---------------------------------------------------------------------------
 
-def _run_job(job_id: str, video_url: str):
+def _run_job(job_id: str, video_urls: List[str]):
     work_dir = Path(tempfile.mkdtemp(prefix=f"oneraw_{job_id}_"))
     log.info("[%s] work_dir: %s", job_id, work_dir)
 
     try:
         # --- download -------------------------------------------------------
         _set_state(job_id, status="downloading")
-        log.info("[%s] Downloading video from %s", job_id, video_url)
 
-        video_name = video_url.split("?")[0].rstrip("/").split("/")[-1] or "input.mp4"
-        if not video_name.lower().endswith(".mp4"):
-            video_name += ".mp4"
-        video_path = work_dir / video_name
+        downloaded: List[Path] = []
+        for i, url in enumerate(video_urls):
+            log.info("[%s] Downloading video %d/%d: %s", job_id, i + 1, len(video_urls), url)
+            name = url.split("?")[0].rstrip("/").split("/")[-1] or f"input_{i}.mp4"
+            if not name.lower().endswith(".mp4"):
+                name += ".mp4"
+            # avoid collisions when two URLs have the same filename
+            dest = work_dir / f"{i:02d}_{name}"
+            _download_video(url, dest)
+            size_mb = dest.stat().st_size / (1024 * 1024)
+            log.info("[%s] Downloaded %.1f MB -> %s", job_id, size_mb, dest.name)
+            downloaded.append(dest)
 
-        with requests.get(video_url, stream=True, timeout=600) as resp:
-            resp.raise_for_status()
-            with open(video_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    f.write(chunk)
+        # --- merge (only when more than one clip) ---------------------------
+        if len(downloaded) == 1:
+            video_path = downloaded[0]
+        else:
+            video_path = work_dir / "merged_input.mp4"
+            try:
+                _merge_videos(downloaded, video_path)
+            except RuntimeError as exc:
+                log.error("[%s] Merge failed: %s", job_id, exc)
+                _set_state(
+                    job_id,
+                    status="failed",
+                    error=str(exc),
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return
+            size_mb = video_path.stat().st_size / (1024 * 1024)
+            log.info("[%s] Merged -> %s  (%.1f MB)", job_id, video_path.name, size_mb)
 
-        size_mb = video_path.stat().st_size / (1024 * 1024)
-        log.info("[%s] Downloaded %.1f MB -> %s", job_id, size_mb, video_path.name)
         _set_state(job_id, video_path=str(video_path))
 
         # --- pipeline -------------------------------------------------------
@@ -252,33 +309,47 @@ def job_status(job_id: str):
 @app.route("/run-pipeline", methods=["POST"])
 def run_pipeline():
     body = request.get_json(silent=True) or {}
-    video_url = (body.get("video_url") or "").strip()
 
-    if not video_url:
-        return jsonify({"error": "video_url is required"}), 400
+    # Accept either a single string or an array
+    raw_single = body.get("video_url")
+    raw_multi  = body.get("video_urls")
 
-    job_id = str(uuid.uuid4())
+    if raw_multi is not None:
+        if not isinstance(raw_multi, list):
+            return jsonify({"error": "video_urls must be an array"}), 400
+        video_urls = [u.strip() for u in raw_multi if isinstance(u, str) and u.strip()]
+    elif raw_single is not None:
+        url = str(raw_single).strip()
+        video_urls = [url] if url else []
+    else:
+        video_urls = []
+
+    if not video_urls:
+        return jsonify({"error": "video_url or video_urls is required"}), 400
+
+    job_id    = str(uuid.uuid4())
     queued_at = datetime.now(timezone.utc).isoformat()
 
     with _lock:
         _jobs[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "video_url": video_url,
-            "queued_at": queued_at,
-            "finished_at": None,
-            "outputs": {},
-            "error": None,
+            "job_id":       job_id,
+            "status":       "queued",
+            "video_urls":   video_urls,
+            "queued_at":    queued_at,
+            "finished_at":  None,
+            "outputs":      {},
+            "error":        None,
             "pipeline_log": {},
         }
 
-    thread = threading.Thread(target=_run_job, args=(job_id, video_url), daemon=True)
+    thread = threading.Thread(target=_run_job, args=(job_id, video_urls), daemon=True)
     thread.start()
 
     return jsonify({
-        "job_id": job_id,
-        "status": "queued",
-        "status_url": f"/status/{job_id}",
+        "job_id":      job_id,
+        "status":      "queued",
+        "video_count": len(video_urls),
+        "status_url":  f"/status/{job_id}",
     }), 202
 
 
