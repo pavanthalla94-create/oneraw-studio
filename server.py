@@ -110,6 +110,9 @@ def _get_job(job_id: str) -> dict | None:
 # Download + merge helpers
 # ---------------------------------------------------------------------------
 
+CROSSFADE_DURATION = 1.0  # seconds — overlap between consecutive clips
+
+
 def _download_video(url: str, dest: Path) -> None:
     with requests.get(url, stream=True, timeout=600) as resp:
         resp.raise_for_status()
@@ -118,21 +121,107 @@ def _download_video(url: str, dest: Path) -> None:
                 f.write(chunk)
 
 
-def _merge_videos(paths: List[Path], output: Path) -> None:
-    """Concatenate videos in sequence using FFmpeg concat demuxer (stream copy)."""
-    concat_list = output.parent / "concat_list.txt"
-    lines = [f"file '{p.as_posix()}'\n" for p in paths]
-    concat_list.write_text("".join(lines), encoding="utf-8")
-
+def _get_duration(path: Path) -> float:
+    """Return video duration in seconds via ffprobe."""
+    # Try stream-level duration first (more accurate for VFR/containers)
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(concat_list),
-        "-c", "copy",
-        str(output),
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=duration",
+        "-of", "json",
+        str(path),
     ]
-    log.info("Merging %d videos -> %s", len(paths), output.name)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode == 0:
+        streams = json.loads(result.stdout).get("streams", [])
+        if streams and streams[0].get("duration"):
+            return float(streams[0]["duration"])
+
+    # Fallback: container-level duration
+    cmd2 = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        str(path),
+    ]
+    result2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result2.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on {path.name}: {result2.stderr}")
+    dur = json.loads(result2.stdout).get("format", {}).get("duration")
+    if not dur:
+        raise RuntimeError(f"No duration found for {path.name}")
+    return float(dur)
+
+
+def _merge_videos(paths: List[Path], output: Path) -> None:
+    """Concatenate clips with xfade/acrossfade crossfade transitions.
+
+    Each consecutive pair overlaps by CROSSFADE_DURATION seconds.
+    xfade offsets are accumulated across the chain:
+        offset_i = sum(d[0..i-1]) - i * xd
+    """
+    n = len(paths)
+
+    # Probe durations
+    durations: List[float] = []
+    for p in paths:
+        d = _get_duration(p)
+        durations.append(d)
+        log.info("  %s  %.2fs", p.name, d)
+
+    # Clamp crossfade so it never exceeds half the shortest clip
+    xd = min(CROSSFADE_DURATION, min(durations) / 2)
+    log.info("Crossfade duration: %.2fs", xd)
+
+    # Build -i flags
+    inputs: List[str] = []
+    for p in paths:
+        inputs += ["-i", str(p)]
+
+    # Build chained xfade (video) and acrossfade (audio) filter graph.
+    # After each xfade the running clock shrinks by xd because the clips overlap.
+    v_filters: List[str] = []
+    a_filters: List[str] = []
+    current_v    = "[0:v]"
+    current_a    = "[0:a]"
+    running_dur  = durations[0]
+
+    for i in range(1, n):
+        offset = max(0.0, running_dur - xd)
+        is_last = (i == n - 1)
+        out_v   = "[v]"       if is_last else f"[xfv{i}]"
+        out_a   = "[a]"       if is_last else f"[xfa{i}]"
+
+        v_filters.append(
+            f"{current_v}[{i}:v]"
+            f"xfade=transition=fade:duration={xd:.3f}:offset={offset:.3f}"
+            f"{out_v}"
+        )
+        a_filters.append(
+            f"{current_a}[{i}:a]"
+            f"acrossfade=d={xd:.3f}"
+            f"{out_a}"
+        )
+
+        current_v    = out_v
+        current_a    = out_a
+        running_dur  = running_dur + durations[i] - xd
+
+    filter_complex = ";".join(v_filters + a_filters)
+
+    cmd = (
+        ["ffmpeg", "-y"]
+        + inputs
+        + ["-filter_complex", filter_complex,
+           "-map", "[v]",
+           "-map", "[a]",
+           "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+           "-c:a", "aac", "-b:a", "192k",
+           "-movflags", "+faststart",
+           str(output)]
+    )
+
+    log.info("Merging %d clips with %.1fs crossfade -> %s", n, xd, output.name)
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -140,8 +229,7 @@ def _merge_videos(paths: List[Path], output: Path) -> None:
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg merge failed:\n{result.stderr[-3000:]}")
-    concat_list.unlink(missing_ok=True)
+        raise RuntimeError(f"FFmpeg crossfade merge failed:\n{result.stderr[-3000:]}")
 
 
 # ---------------------------------------------------------------------------
